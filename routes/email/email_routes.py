@@ -58,6 +58,14 @@ from .email_helpers import (
     _imap_connect, _imap, _decode_header, _detect_sent_folder, _detect_drafts_folder,
     _extract_attachment_text, _list_attachments_from_msg, _has_visible_attachments, _is_likely_signature_image_attachment,
     _extract_attachment_to_disk, _extract_html, _extract_text,
+
+# Email performance metrics
+_SMTP_POOL, _IMAP_POOL, _SMTP_METRICS, _IMAP_METRICS, _EMAIL_ERRORS
+)
+
+router = APIRouter(prefix="/email", tags=["email"])
+
+from routes.email.email_helpers import (
     _fetch_sender_thread_context, _pre_retrieve_context,
     _EMAIL_REPLY_SYS_PROMPT_BASE, _POOL_HOOKS,
     _friendly_email_auth_error, _email_summary_failure_log_detail,
@@ -67,6 +75,23 @@ from .email_helpers import (
     ATTACHMENTS_DIR, COMPOSE_UPLOADS_DIR, SCHEDULED_DB,
     attachment_extract_dir, _email_cache_owner_clause, email_translation_body_hash,
 )
+from typing import Dict, List
+from pydantic import BaseModel
+
+
+class EmailPerformanceMetrics(BaseModel):
+    """Performance metrics for email operations."""
+    account_id: str
+    smtp_connection_time_ms: float
+    imap_connection_time_ms: float
+    smtp_errors: List[str]
+    imap_errors: List[str]
+    last_updated: str
+
+
+class EmailPerformanceReport(BaseModel):
+    """Performance report for all email accounts."""
+    metrics: List[EmailPerformanceMetrics]
 from .email_pollers import _start_poller
 
 logger = logging.getLogger(__name__)
@@ -1073,6 +1098,149 @@ def _email_index_search(owner: str, account_id: str | None, folder: str, query: 
             "folder": row_folder or folder,
         })
     return emails, total, (total_row or [None, None])[1]
+
+
+async def _measure_smtp_performance(cfg: dict) -> tuple:
+    """Measure SMTP connection performance."""
+    from .email_helpers import _SMTP_METRICS, _EMAIL_ERRORS
+    
+    start_time = time.time()
+    error = None
+    
+    try:
+        # Test SMTP connection
+        smtp_host = cfg.get("smtp_host")
+        smtp_port = cfg.get("smtp_port", 587)
+        smtp_user = cfg.get("smtp_user")
+        
+        if smtp_host and smtp_user:
+            pool_key = f"{smtp_host}:{smtp_port}:{smtp_user}"
+            # Just test the connection, don't actually send
+            with smtplib.SMTP(timeout=10) as smtp:
+                smtp.connect(smtp_host, smtp_port)
+                if cfg.get("smtp_starttls"):
+                    smtp.starttls()
+    except Exception as e:
+        error = str(e)
+        _EMAIL_ERRORS.append(f"SMTP error: {error}")
+        if len(_EMAIL_ERRORS) > 20:  # Keep last 20 errors
+            _EMAIL_ERRORS.pop(0)
+    
+    connection_time = (time.time() - start_time) * 1000  # ms
+    
+    # Update metrics
+    _SMTP_METRICS["total_connections"] += 1
+    _SMTP_METRICS["connection_times"].append(connection_time)
+    if len(_SMTP_METRICS["connection_times"]) > 100:  # Keep last 100 measurements
+        _SMTP_METRICS["connection_times"].pop(0)
+    
+    return connection_time, error
+
+
+async def _measure_imap_performance(cfg: dict) -> tuple:
+    """Measure IMAP connection performance."""
+    from .email_helpers import _IMAP_METRICS, _EMAIL_ERRORS
+    
+    start_time = time.time()
+    error = None
+    
+    try:
+        # Test IMAP connection
+        imap_host = cfg.get("imap_host")
+        imap_port = cfg.get("imap_port", 993)
+        imap_user = cfg.get("imap_user")
+        
+        if imap_host and imap_user:
+            # Just test the connection, don't actually login
+            with _open_imap_connection(imap_host, imap_port, starttls=bool(cfg.get("imap_starttls")), timeout=10) as imap:
+                pass
+    except Exception as e:
+        error = str(e)
+        _EMAIL_ERRORS.append(f"IMAP error: {error}")
+        if len(_EMAIL_ERRORS) > 20:  # Keep last 20 errors
+            _EMAIL_ERRORS.pop(0)
+    
+    connection_time = (time.time() - start_time) * 1000  # ms
+    
+    # Update metrics
+    _IMAP_METRICS["total_connections"] += 1
+    _IMAP_METRICS["connection_times"].append(connection_time)
+    if len(_IMAP_METRICS["connection_times"]) > 100:  # Keep last 100 measurements
+        _IMAP_METRICS["connection_times"].pop(0)
+    
+    return connection_time, error
+
+
+@router.get("/email/performance-report", response_model=EmailPerformanceReport)
+async def get_email_performance_report(
+    owner: str = Depends(require_owner),
+) -> EmailPerformanceReport:
+    """Get performance metrics for all email accounts."""
+    from .email_helpers import (
+        _list_email_accounts, _get_email_config, 
+        _SMTP_POOL, _IMAP_POOL, _SMTP_METRICS, _IMAP_METRICS, _EMAIL_ERRORS
+    )
+    
+    # Calculate average connection times
+    avg_smtp_time = 0
+    if _SMTP_METRICS["connection_times"]:
+        avg_smtp_time = sum(_SMTP_METRICS["connection_times"]) / len(_SMTP_METRICS["connection_times"])
+    
+    avg_imap_time = 0
+    if _IMAP_METRICS["connection_times"]:
+        avg_imap_time = sum(_IMAP_METRICS["connection_times"]) / len(_IMAP_METRICS["connection_times"])
+    
+    # Build connection metrics
+    connection_metrics = {
+        "smtp": {
+            "avg_connection_time_ms": round(avg_smtp_time, 2),
+            "total_connections": _SMTP_METRICS["total_connections"],
+            "reused_connections": _SMTP_METRICS["reused_connections"]
+        },
+        "imap": {
+            "avg_connection_time_ms": round(avg_imap_time, 2),
+            "total_connections": _IMAP_METRICS["total_connections"],
+            "reused_connections": _IMAP_METRICS["reused_connections"]
+        }
+    }
+    
+    # Return the performance report
+    return EmailPerformanceReport(
+        smtp_pool_size=len(_SMTP_POOL),
+        imap_pool_size=len(_IMAP_POOL),
+        connection_metrics=connection_metrics,
+        recent_errors=_EMAIL_ERRORS[-10:]  # Return last 10 errors
+    )
+
+
+async def _measure_smtp_performance(cfg: dict) -> tuple[float, List[str]]:
+    """Measure SMTP connection time and collect errors."""
+    import time
+    errors = []
+    start_time = time.time()
+    
+    try:
+        await _test_smtp_connection(cfg)
+    except Exception as e:
+        errors.append(str(e))
+    
+    elapsed = (time.time() - start_time) * 1000  # Convert to milliseconds
+    return elapsed, errors
+
+
+async def _measure_imap_performance(cfg: dict) -> tuple[float, List[str]]:
+    """Measure IMAP connection time and collect errors."""
+    import time
+    errors = []
+    start_time = time.time()
+    
+    try:
+        await _test_imap_connection(cfg)
+    except Exception as e:
+        errors.append(str(e))
+    
+    elapsed = (time.time() - start_time) * 1000  # Convert to milliseconds
+    return elapsed, errors
 
 
 def _email_search_terms(query: str) -> list[str]:

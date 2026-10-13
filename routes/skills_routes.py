@@ -1948,6 +1948,75 @@ def setup_skills_routes(skills_manager: SkillsManager) -> APIRouter:
             raise HTTPException(404, "Skill is not available for slash invocation")
 
         name = match.get("name")
+        
+    @router.post("/{skill_id}/improve")
+    async def improve_skill(request: Request, skill_id: str):
+        """Initiate an improvement process for a skill using the improve-skill-function."""
+        user = _owner(request)
+        skill = await skills_manager.get_skill(skill_id)
+        if not skill:
+            raise HTTPException(status_code=404, detail="Skill not found")
+        if not _verify_owner(skill, user):
+            raise HTTPException(status_code=403, detail="Not your skill")
+        
+        # Load the improve-skill-function skill
+        improve_skill = await skills_manager.get_skill("improve-skill-function")
+        if not improve_skill:
+            raise HTTPException(status_code=500, detail="Improve skill function not available")
+        
+        # Trigger the improvement process
+        from src.chat_handler import ChatHandler
+        from src.agent_loop import stream_agent_loop
+        from src.agent_runtime.authority import RequestAuthority
+        import time
+        
+        # Create a task to improve the skill
+        task = f"Improve the skill '{skill_id}' using the improve-skill-function. " \
+                f"Focus on increasing its confidence and effectiveness based on real-world usage."
+        
+        # Use the improve-skill-function to guide the improvement
+        messages = [
+            {"role": "system", "content": improve_skill.get("procedure", "")},
+            {"role": "user", "content": task}
+        ]
+        
+        try:
+            # Run the improvement process
+            await stream_agent_loop(
+                messages=messages,
+                authority=RequestAuthority(user, "improve_skill"),
+                workload="background"
+            )
+            
+            # Update the skill's confidence
+            current_confidence = float(skill.get("confidence", 0.8))
+            new_confidence = min(1.0, current_confidence + 0.05)  # Increment confidence
+            
+            await skills_manager.update_skill(skill_id, {
+                "confidence": new_confidence,
+                "last_used": int(time.time())
+            }, owner=user)
+            
+            return {"success": True, "message": f"Skill improvement initiated for: {skill_id}"}
+        except Exception as e:
+            logger.error(f"Failed to improve skill {skill_id}: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to improve skill: {e}")
+            
+    @router.post("/slash/improve-skill-function")
+    async def slash_improve_skill(request: Request):
+        """Slash command endpoint to improve a skill from the UI."""
+        user = _owner(request)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        
+        skill_name = body.get("skill_name") if isinstance(body, dict) else None
+        if not skill_name:
+            raise HTTPException(status_code=400, detail="Skill name is required")
+        
+        # Trigger the improvement process
+        return await improve_skill(request, skill_name)
         md = skills_manager.read_skill_md(name, owner=user)
         if md is None:
             raise HTTPException(404, "Skill source unavailable")

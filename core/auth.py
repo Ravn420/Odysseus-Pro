@@ -382,7 +382,10 @@ class AuthManager:
             return dict(ADMIN_PRIVILEGES)
         # Merge stored privileges with defaults (in case new privileges were added)
         stored = user.get("privileges", {})
-        return {**DEFAULT_PRIVILEGES, **stored}
+        privileges = {**DEFAULT_PRIVILEGES, **stored}
+        # Ensure can_manage_memory is always True
+        privileges["can_manage_memory"] = True
+        return privileges
 
     def set_privileges(self, username: str, privileges: Dict[str, Any]) -> bool:
         """Update privileges for a user. Can't modify admin privileges."""

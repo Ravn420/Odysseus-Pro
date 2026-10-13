@@ -1546,7 +1546,13 @@ function initializeEventListeners() {
       // user's "Show in sidebar" toggle is on. The user has to toggle
       // off then on to trigger applyUIVis a second time, which is the
       // bug they report as "deep research only shows after I toggle".
-      try { if (window.applyUIVis && window.loadUIVis) window.applyUIVis(window.loadUIVis()); } catch (_) {}
+      try {
+        if (window.applyUIVis && window.loadUIVis) {
+          window.applyUIVis(window.loadUIVis());
+          // Ensure skills button is always visible in the DOM
+          ensureSkillsButtonVisible();
+        }
+      } catch (_) {}
     })
     .catch(() => {});
 
@@ -1788,6 +1794,15 @@ function initializeEventListeners() {
     state[_modeKey(stateKey, mode)] = value;
     saveToggleState(state);
   }
+
+  // Ensure skills button is always visible
+  function ensureSkillsButtonVisible() {
+    const skillsBtn = document.getElementById('tool-skills-btn');
+    const railSkillsBtn = document.getElementById('rail-skills');
+    if (skillsBtn) skillsBtn.style.display = '';
+    if (railSkillsBtn) railSkillsBtn.style.display = '';
+  }
+  window.ensureSkillsButtonVisible = ensureSkillsButtonVisible;
 
   const TOOL_TOGGLE_TOAST_LABELS = {
     web: 'Web search',

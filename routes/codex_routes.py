@@ -631,10 +631,14 @@ def setup_codex_routes(
             f"else tmux capture-pane -t {session_id} -p -S -{tail}; fi"
         )
         if host:
-            import shlex
-            cmd = f"ssh {port_flag}{host} {shlex.quote(inner)}"
+            # Validate host to prevent command injection
+            if not re.fullmatch(r"^[a-zA-Z0-9.-]+$", host):
+                raise HTTPException(400, "Invalid host")
+            # Use create_subprocess_exec instead of shell to prevent injection
+            ssh_args = ["ssh"] + port_flag.split() + [host, inner]
+            cmd = ssh_args
         else:
-            cmd = inner
+            cmd = ["/bin/sh", "-c", inner]
         result = await _run_shell(cmd, timeout=15)
         return {
             "session_id": session_id,
@@ -694,9 +698,14 @@ def setup_codex_routes(
         task = next((t for t in tasks if t.get("sessionId") == session_id), None)
         host, port_flag = _ssh_prefix_for_task(task or {})
         if host:
-            cmd = f"ssh {port_flag}{host} \"tmux kill-session -t {session_id}\""
+            # Validate host to prevent command injection
+            if not re.fullmatch(r"^[a-zA-Z0-9.-]+$", host):
+                raise HTTPException(400, "Invalid host")
+            # Use create_subprocess_exec instead of shell to prevent injection
+            ssh_args = ["ssh"] + port_flag.split() + [host, f"tmux kill-session -t {session_id}"]
+            cmd = ssh_args
         else:
-            cmd = f"tmux kill-session -t {session_id}"
+            cmd = ["tmux", "kill-session", "-t", session_id]
         result = await _run_shell(cmd, timeout=10)
         return {"session_id": session_id, "exit_code": result.get("exit_code"), "host": host or "local"}
 

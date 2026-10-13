@@ -26,21 +26,56 @@ import json
 import re
 import html
 import logging
+import asyncio
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 import mimetypes
 from pathlib import Path
+from typing import Dict, Optional
+
+# Connection pools for SMTP and IMAP
+_SMTP_POOL: Dict[str, smtplib.SMTP] = {}
+_IMAP_POOL: Dict[str, imaplib.IMAP4] = {}
+
+# Performance metrics
+_SMTP_METRICS = {
+    "total_connections": 0,
+    "reused_connections": 0,
+    "connection_times": []
+}
+
+_IMAP_METRICS = {
+    "total_connections": 0,
+    "reused_connections": 0,
+    "connection_times": []
+}
+
+# Recent errors
+_EMAIL_ERRORS = []
 
 from fastapi import Query, HTTPException, Request
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 from src.auth_helpers import _auth_disabled, get_current_user
 from src.secret_storage import decrypt as _decrypt
 from src.url_safety import OutboundAddressBlocked, connect_outbound_tcp
 
 logger = logging.getLogger(__name__)
+
+
+class ConnectionMetrics(BaseModel):
+    avg_connection_time_ms: float
+    total_connections: int
+    reused_connections: int
+
+
+class EmailPerformanceReport(BaseModel):
+    smtp_pool_size: int
+    imap_pool_size: int
+    connection_metrics: Dict[str, ConnectionMetrics]
+    recent_errors: List[str]
 
 
 class EmailNotConfiguredError(RuntimeError):
@@ -252,11 +287,12 @@ class _PolicySMTP_SSL(smtplib.SMTP_SSL):
 
 
 def _send_smtp_message(cfg: dict, from_addr: str, recipients: list[str], message: str | bytes, timeout: int = 30) -> None:
-    """Send through SMTP using the configured transport security mode."""
+    """Send through SMTP using the configured transport security mode with connection pooling."""
     host = cfg["smtp_host"]
     port = int(cfg.get("smtp_port") or 465)
     user = cfg.get("smtp_user") or ""
     password = cfg.get("smtp_password") or ""
+    pool_key = f"{host}:{port}:{user}"
 
     def _auth_smtp(smtp):
         if cfg.get("oauth_provider") == "google":
@@ -271,17 +307,37 @@ def _send_smtp_message(cfg: dict, from_addr: str, recipients: list[str], message
     security = _smtp_security_mode(cfg)
     block_private = _mail_private_blocked(cfg.get("owner"))
 
-    if security == "ssl":
-        with _PolicySMTP_SSL(host, port, timeout=timeout, block_private=block_private) as smtp:
+    # Reuse existing connection if available
+    smtp = _SMTP_POOL.get(pool_key)
+    if smtp:
+        try:
+            if security == "starttls":
+                smtp.starttls()
             _auth_smtp(smtp)
             smtp.sendmail(from_addr, recipients, message)
-        return
+            # Track reused connection
+            _SMTP_METRICS["reused_connections"] += 1
+            return
+        except Exception:
+            # Connection is bad, remove from pool
+            _SMTP_POOL.pop(pool_key, None)
 
-    with _PolicySMTP(host, port, timeout=timeout, block_private=block_private) as smtp:
+    # Create new connection
+    if security == "ssl":
+        smtp = _PolicySMTP_SSL(host, port, timeout=timeout, block_private=block_private)
+    else:
+        smtp = _PolicySMTP(host, port, timeout=timeout, block_private=block_private)
+
+    try:
         if security == "starttls":
             smtp.starttls()
         _auth_smtp(smtp)
         smtp.sendmail(from_addr, recipients, message)
+        # Store connection in pool
+        _SMTP_POOL[pool_key] = smtp
+    except Exception:
+        smtp.quit()
+        raise
 
 
 def _friendly_email_auth_error(protocol: str, host: str, error: object) -> str:
@@ -1356,6 +1412,20 @@ def _imap_connect(account_id: str | None = None, owner: str = "",
         raise EmailNotConfiguredError(
             f"IMAP is not configured for account {cfg.get('account_name') or 'default'!r}"
         )
+    
+    pool_key = f"{cfg['imap_host']}:{cfg['imap_port']}:{cfg['imap_user']}"
+    
+    # Reuse existing connection if available
+    conn = _IMAP_POOL.get(pool_key)
+    if conn:
+        try:
+            # Test the connection by fetching capabilities
+            conn.capability()
+            return conn
+        except Exception:
+            # Connection is bad, remove from pool
+            _IMAP_POOL.pop(pool_key, None)
+    
     # Connection mode:
     #   STARTTLS on → plain + upgrade
     #   STARTTLS off + port 993 → implicit SSL (IMAPS)
@@ -1378,6 +1448,8 @@ def _imap_connect(account_id: str | None = None, owner: str = "",
             conn.authenticate("XOAUTH2", lambda x: _xoauth2_bytes(cfg["imap_user"], token))
         else:
             conn.login(cfg["imap_user"], cfg["imap_password"])
+        # Store connection in pool
+        _IMAP_POOL[pool_key] = conn
     except Exception:
         # A failed AUTHENTICATE (e.g. an Office 365 app password on an
         # MFA-enabled tenant, #3174, or an expired/revoked OAuth token)

@@ -508,7 +508,8 @@ function _turnSavingsHtml(sk) {
 
 function _skillStatsHtml(sk) {
   const approved = skillIsApproved(sk, _skillApprovalThreshold) ? _statusPill(sk) : '';
-  return `${_auditMarks(sk)}${approved}`;
+  const confidence = sk.confidence !== undefined ? `<span class="memory-cat-badge skill-tag-pill skill-confidence-pill" title="Confidence level">${Math.round((sk.confidence || 0) * 100)}%</span>` : '';
+  return `${confidence} ${_auditMarks(sk)}${approved}`;
 }
 
 function _skillUsageHtml(sk) {
@@ -1003,23 +1004,51 @@ function renderSkillsList() {
     testBtn.title = 'Test this skill — run it + AI judge';
     testBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      // Immediate visual feedback: previously the click looked like nothing
-      // happened because _testSkill awaits a status fetch before overwriting
-      // the preview — so users would tap a second time. Mark the button as
-      // pending right away so the first tap is obviously registered.
-      if (testBtn.dataset.busy === '1') return;  // also dedupe rapid double-tap
+      if (testBtn.dataset.busy === '1') return;
       testBtn.dataset.busy = '1';
       testBtn.disabled = true;
       const _origHTML = testBtn.innerHTML;
       testBtn.innerHTML = _svg(_ICON.test, { size: 11 }) + 'Starting…';
       Promise.resolve(_testSkill(card, name)).finally(() => {
-        // The preview gets overwritten by _testSkill, which removes the
-        // testBtn from the DOM. The cleanup below only matters if the
-        // button still exists (e.g. _testSkill bailed early).
         if (document.body.contains(testBtn)) {
           testBtn.disabled = false;
           testBtn.dataset.busy = '';
           testBtn.innerHTML = _origHTML;
+        }
+      });
+    });
+
+    // Add Improve Skill button
+    const improveBtn = document.createElement('button');
+    improveBtn.className = 'doclib-card-text-btn doclib-card-action-btn';
+    improveBtn.innerHTML = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:3px;"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>Improve';
+    improveBtn.title = 'Improve this skill to increase its confidence';
+    improveBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (improveBtn.dataset.busy === '1') return;
+      improveBtn.dataset.busy = '1';
+      improveBtn.disabled = true;
+      const _origHTML = improveBtn.innerHTML;
+      improveBtn.innerHTML = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:3px;"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>Improving…';
+      
+      // Trigger the improve-skill-function
+      fetch(`${API}/api/skills/${encodeURIComponent(name)}/improve`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      }).then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      }).then(data => {
+        uiModule.showToast(`Skill improvement initiated for: ${name}`);
+        // Refresh the skills list to show updated confidence
+        loadSkills();
+      }).catch(e => {
+        uiModule.showError(`Failed to improve skill: ${e.message}`);
+      }).finally(() => {
+        if (document.body.contains(improveBtn)) {
+          improveBtn.disabled = false;
+          improveBtn.dataset.busy = '';
+          improveBtn.innerHTML = _origHTML;
         }
       });
     });
@@ -1029,6 +1058,7 @@ function renderSkillsList() {
     const btnRow = document.createElement('div');
     btnRow.className = 'doclib-action-btn-row';
     btnRow.appendChild(testBtn);
+    btnRow.appendChild(improveBtn);
     btnRow.appendChild(editBtn);
     btnRow.appendChild(delBtn);
     rightGroup.appendChild(btnRow);

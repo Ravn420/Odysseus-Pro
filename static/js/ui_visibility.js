@@ -68,6 +68,8 @@ export const resolveVisibility = (state = {}) => {
   for (const [key, selector] of Object.entries(UI_VIS_MAP)) {
     let visible = key in state ? state[key] !== false : !UI_VIS_DEFAULT_OFF.has(key);
     if (!toolsOn && key.startsWith('tool-')) visible = false;
+    // Always show skills button regardless of user preferences
+    if (key === 'tool-skills') visible = true;
     out[selector] = visible;
   }
   return out;
